@@ -15,7 +15,10 @@ The selection of embryos is a key for the success of in vitro fertilization (IVF
 
 ## WORKFLOW
 The overall workflow of ESAVA is:
-![ESAVA design](ESAVA_workflow.jpg?raw=true)
-
+<p float="left">
+  <img src="ESAVA_workflow.jpg?raw=true"/>
+</p>
 The segmentation workflow is:
-![Segmentation design](segmentation_workflow.jpg?raw=true)
+<p float="left">
+  <img src="segmentation_workflow.jpg?raw=true"/>
+</p>
