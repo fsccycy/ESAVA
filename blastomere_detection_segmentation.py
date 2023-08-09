@@ -1,0 +1,1104 @@
+# -*- coding: UTF-8* -*-
+import argparse
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import os
+import cv2
+import numpy as np
+import sys
+import pickle
+from optparse import OptionParser
+import time
+import pdb
+import math
+import copy
+from keras import backend as K
+from keras.models import Model
+from keras.layers import Input, Add, Dense, Activation, Flatten, Convolution2D, MaxPooling2D, ZeroPadding2D, \
+    AveragePooling2D, TimeDistributed
+from keras.engine import Layer, InputSpec
+from keras import initializers, regularizers
+from skimage import exposure,measure,color
+from scipy.ndimage.morphology import binary_fill_holes
+from skimage.restoration import calibrate_denoiser, denoise_wavelet, denoise_tv_chambolle, estimate_sigma
+from functools import partial
+
+
+def main(img_path=None, img_file=None, output_file=None, out_dir=None, bbox_threshold=0.8):
+
+
+    def apply_ahe(img):
+
+        channels = cv2.split(img)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        equalized_channels = [clahe.apply(channel) for channel in channels]
+        equalized_image = cv2.merge(equalized_channels)
+        return equalized_image
+
+
+    def maxRegionFilter(image):
+        """
+            Save the max region
+        """
+        labels = measure.label(image)
+        regions = measure.regionprops(labels)
+        cell_region = max(regions, key=lambda x: x.area)
+        image[labels != cell_region.label] = 0
+        image = binary_fill_holes(image) * 255.0
+        return image
+
+
+    def enhance_cell(image):
+        pLow, pHigh = np.percentile(image, (1, 99))
+        img_rescale = exposure.rescale_intensity(image, in_range=(pLow, pHigh))
+        return img_rescale
+
+
+    def color_scale_display(img, Shadow=0, Highlight=255, Midtones=1.0):
+        """
+            AutoLevels, similar to Photoshop
+        """
+        if Highlight > 255:
+            Highlight = 255
+        if Shadow < 0:
+            Shadow = 0
+        if Shadow >= Highlight:
+            Shadow = Highlight - 2
+        if Midtones > 9.99:
+            Midtones = 9.99
+        if Midtones < 0.01:
+            Midtones = 0.01
+
+        img = np.array(img, dtype=np.float16)
+
+        Diff = Highlight - Shadow
+        img = img - Shadow
+        img[img < 0] = 0
+        img = (img / Diff) ** (1 / Midtones) * 255
+        img[img > 255] = 255
+
+        img = np.array(img, dtype=np.uint8)
+        return img
+
+    def needAjust(image):
+        h, s, v = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2HSV))
+        hv = np.sqrt(np.mean(h) ** 2 + np.mean(v) ** 2)
+        return hv < 120
+
+    def grab_cut(image,rect):
+        mask = np.zeros(image.shape[:2], np.uint8)
+        bgdModel = np.zeros((1, 65), np.float64)
+        fgdModel = np.zeros((1, 65), np.float64)
+        cv2.grabCut(np.uint8(image), mask, rect, bgdModel, fgdModel, 10, cv2.GC_INIT_WITH_RECT)  # 10
+        mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+        return mask2
+
+    def bbox_reg(left, top, right, bottom, img_width, img_height, alpha=1.0):
+        """
+        :param alpha: amplification coefficient
+        """
+        w = right - left
+        h = bottom - top
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        left = max(0, center_x - alpha * w)
+        top = max(0, center_y - alpha * h)
+        right = min(img_width, center_x + alpha * w)
+        bottom = min(img_height, center_y + alpha * h)
+        return (int(left), int(top)), (int(right), int(bottom))
+
+    # config
+    class Config:
+
+        def __init__(self):
+            self.verbose = True
+
+            # base CNN model
+            self.network = 'resnet50'
+
+            # setting for data augmentation
+            self.use_horizontal_flips = False
+            self.use_vertical_flips = False
+            self.rot_90 = False
+
+            # anchor box scales
+            self.anchor_box_scales = [128, 256, 512]
+
+            # anchor box ratios
+            self.anchor_box_ratios = [[1, 1], [1, 2], [2, 1]]
+
+            # size to resize the smallest side of the image
+            self.im_size = 600
+
+            # image channel-wise mean to subtract
+            self.img_channel_mean = [103.939, 116.779, 123.68]
+            self.img_scaling_factor = 1.0
+
+            # number of ROIs at once
+            self.num_rois = 300
+
+            # stride at the RPN (this depends on the network configuration)
+            self.rpn_stride = 16
+
+            self.balanced_classes = False
+
+            # scaling the stdev
+            self.std_scaling = 4.0
+            self.classifier_regr_std = [8.0, 8.0, 4.0, 4.0]
+
+            # overlaps for RPN
+            self.rpn_min_overlap = 0.3
+            self.rpn_max_overlap = 0.7
+
+            # overlaps for classifier ROIs
+            self.classifier_min_overlap = 0.1
+            self.classifier_max_overlap = 0.5
+
+            # placeholder for the class mapping, automatically generated by the parser
+            self.class_mapping = None
+
+            self.model_path = 'model_frcnn.resnet50.hdf5'
+
+
+    def apply_regr(x, y, w, h, tx, ty, tw, th):
+        try:
+            cx = x + w / 2.
+            cy = y + h / 2.
+            cx1 = tx * w + cx
+            cy1 = ty * h + cy
+            w1 = math.exp(tw) * w
+            h1 = math.exp(th) * h
+            x1 = cx1 - w1 / 2.
+            y1 = cy1 - h1 / 2.
+            x1 = int(round(x1))
+            y1 = int(round(y1))
+            w1 = int(round(w1))
+            h1 = int(round(h1))
+
+            return x1, y1, w1, h1
+
+        except ValueError:
+            return x, y, w, h
+        except OverflowError:
+            return x, y, w, h
+        except Exception as e:
+            print(e)
+            return x, y, w, h
+
+    def apply_regr_np(X, T):
+        try:
+            x = X[0, :, :]
+            y = X[1, :, :]
+            w = X[2, :, :]
+            h = X[3, :, :]
+
+            tx = T[0, :, :]
+            ty = T[1, :, :]
+            tw = T[2, :, :]
+            th = T[3, :, :]
+
+            cx = x + w / 2.
+            cy = y + h / 2.
+            cx1 = tx * w + cx
+            cy1 = ty * h + cy
+
+            w1 = np.exp(tw.astype(np.float64)) * w
+            h1 = np.exp(th.astype(np.float64)) * h
+            x1 = cx1 - w1 / 2.
+            y1 = cy1 - h1 / 2.
+
+            x1 = np.round(x1)
+            y1 = np.round(y1)
+            w1 = np.round(w1)
+            h1 = np.round(h1)
+            return np.stack([x1, y1, w1, h1])
+        except Exception as e:
+            print(e)
+            return X
+
+
+    def c_nms(bboxes, scores, nms_threshold=0.6):
+        '''
+        bboxes: predicted bboxes
+        scores: confidence scores
+        '''
+        if len(bboxes) == 0:
+            return []
+        box_keep = []
+        scores_keep = []
+
+        while len(scores) > 0:
+            filter1 = np.where(scores > 0.2)[0]
+            bboxes = bboxes[filter1]
+            scores = scores[filter1]
+            if len(scores) < 1:
+                break
+            order = np.argsort(-scores)
+            i = np.argwhere(order == 0)[0][0]
+            a1 = bboxes[i]
+            a2 = scores[i]
+            s = (a1[3] - a1[1]) * (a1[2] - a1[0])
+            bboxes = np.delete(bboxes, i, axis=0)
+            scores = np.delete(scores, i, axis=0)
+            box_keep.append(a1)
+            scores_keep.append(a2)
+
+            if len(order) == 1:
+                break
+            for i in range(len(bboxes)):
+                xx1 = bboxes[i][0]
+                yy1 = bboxes[i][1]
+                xx2 = bboxes[i][2]
+                yy2 = bboxes[i][3]
+                x1 = max(a1[0], xx1)
+                y1 = max(a1[1], yy1)
+                x2 = min(a1[2], xx2)
+                y2 = min(a1[3], yy2)
+                inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+                area = (yy2 - yy1) * (xx2 - xx1)
+                union = s + area - inter
+                iou = inter / (union + 1e-6)
+                ar = np.minimum(s, area) / np.maximum(s, area)
+                if iou < nms_threshold:
+                    continue
+                scores[i] *= 1 / np.pi * np.exp(-0.5 * (iou ** 2 + ar ** 2))
+        return np.array(box_keep), np.array(scores_keep)
+
+    def non_max_suppression_fast(boxes, probs, overlap_thresh=0.9, max_boxes=300):
+        # if there are no boxes, return an empty list
+        if len(boxes) == 0:
+            return []
+
+        # grab the coordinates of the bounding boxes
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+
+        np.testing.assert_array_less(x1, x2)
+        np.testing.assert_array_less(y1, y2)
+
+        # if the bounding boxes integers, convert them to floats --
+        # this is important since we'll be doing a bunch of divisions
+        if boxes.dtype.kind == "i":
+            boxes = boxes.astype("float")
+
+        # initialize the list of picked indexes
+        pick = []
+
+        # calculate the areas
+        area = (x2 - x1) * (y2 - y1)
+
+        # sort the bounding boxes
+        idxs = np.argsort(probs)
+
+        # keep looping while some indexes still remain in the indexes
+        # list
+        while len(idxs) > 0:
+            # grab the last index in the indexes list and add the
+            # index value to the list of picked indexes
+            last = len(idxs) - 1
+            i = idxs[last]
+            pick.append(i)
+
+            # find the intersection
+
+            xx1_int = np.maximum(x1[i], x1[idxs[:last]])
+            yy1_int = np.maximum(y1[i], y1[idxs[:last]])
+            xx2_int = np.minimum(x2[i], x2[idxs[:last]])
+            yy2_int = np.minimum(y2[i], y2[idxs[:last]])
+
+            ww_int = np.maximum(0, xx2_int - xx1_int)
+            hh_int = np.maximum(0, yy2_int - yy1_int)
+
+            area_int = ww_int * hh_int
+
+            # find the union
+            area_union = area[i] + area[idxs[:last]] - area_int
+
+            # compute the ratio of overlap
+            overlap = area_int / (area_union + 1e-6)
+
+            # delete all indexes from the index list that have
+            idxs = np.delete(idxs, np.concatenate(([last],
+                                                   np.where(overlap > overlap_thresh)[0])))
+
+            if len(pick) >= max_boxes:
+                break
+
+        # return only the bounding boxes that were picked using the integer data type
+        boxes = boxes[pick].astype("int")
+        probs = probs[pick]
+        return boxes, probs
+
+    def rpn_to_roi(rpn_layer, regr_layer, C, dim_ordering, use_regr=True, max_boxes=300, overlap_thresh=0.9):
+
+        regr_layer = regr_layer / C.std_scaling
+
+        anchor_sizes = C.anchor_box_scales
+        anchor_ratios = C.anchor_box_ratios
+
+        assert rpn_layer.shape[0] == 1
+
+        if dim_ordering == 'th':
+            (rows, cols) = rpn_layer.shape[2:]
+
+        elif dim_ordering == 'tf':
+            (rows, cols) = rpn_layer.shape[1:3]
+
+        curr_layer = 0
+        if dim_ordering == 'tf':
+            A = np.zeros((4, rpn_layer.shape[1], rpn_layer.shape[2], rpn_layer.shape[3]))
+        elif dim_ordering == 'th':
+            A = np.zeros((4, rpn_layer.shape[2], rpn_layer.shape[3], rpn_layer.shape[1]))
+
+        for anchor_size in anchor_sizes:
+            for anchor_ratio in anchor_ratios:
+
+                anchor_x = (anchor_size * anchor_ratio[0]) / C.rpn_stride
+                anchor_y = (anchor_size * anchor_ratio[1]) / C.rpn_stride
+                if dim_ordering == 'th':
+                    regr = regr_layer[0, 4 * curr_layer:4 * curr_layer + 4, :, :]
+                else:
+                    regr = regr_layer[0, :, :, 4 * curr_layer:4 * curr_layer + 4]
+                    regr = np.transpose(regr, (2, 0, 1))
+
+                X, Y = np.meshgrid(np.arange(cols), np.arange(rows))
+
+                A[0, :, :, curr_layer] = X - anchor_x / 2
+                A[1, :, :, curr_layer] = Y - anchor_y / 2
+                A[2, :, :, curr_layer] = anchor_x
+                A[3, :, :, curr_layer] = anchor_y
+
+                if use_regr:
+                    A[:, :, :, curr_layer] = apply_regr_np(A[:, :, :, curr_layer], regr)
+
+                A[2, :, :, curr_layer] = np.maximum(1, A[2, :, :, curr_layer])
+                A[3, :, :, curr_layer] = np.maximum(1, A[3, :, :, curr_layer])
+                A[2, :, :, curr_layer] += A[0, :, :, curr_layer]
+                A[3, :, :, curr_layer] += A[1, :, :, curr_layer]
+
+                A[0, :, :, curr_layer] = np.maximum(0, A[0, :, :, curr_layer])
+                A[1, :, :, curr_layer] = np.maximum(0, A[1, :, :, curr_layer])
+                A[2, :, :, curr_layer] = np.minimum(cols - 1, A[2, :, :, curr_layer])
+                A[3, :, :, curr_layer] = np.minimum(rows - 1, A[3, :, :, curr_layer])
+
+                curr_layer += 1
+
+        all_boxes = np.reshape(A.transpose((0, 3, 1, 2)), (4, -1)).transpose((1, 0))
+        all_probs = rpn_layer.transpose((0, 3, 1, 2)).reshape((-1))
+
+        x1 = all_boxes[:, 0]
+        y1 = all_boxes[:, 1]
+        x2 = all_boxes[:, 2]
+        y2 = all_boxes[:, 3]
+
+        idxs = np.where((x1 - x2 >= 0) | (y1 - y2 >= 0))
+
+        all_boxes = np.delete(all_boxes, idxs, 0)
+        all_probs = np.delete(all_probs, idxs, 0)
+
+        result = non_max_suppression_fast(all_boxes, all_probs, overlap_thresh=overlap_thresh, max_boxes=max_boxes)[0]
+
+        return result
+
+
+    class RoiPoolingConv(Layer):
+        '''
+        ROI pooling layer for 2D inputs.
+        See Spatial Pyramid Pooling in Deep Convolutional Networks for Visual Recognition,
+        K. He, X. Zhang, S. Ren, J. Sun
+        # Arguments
+            pool_size: int
+                Size of pooling region to use. pool_size = 7 will result in a 7x7 region.
+            num_rois: number of regions of interest to be used
+        # Input shape
+            list of two 4D tensors [X_img,X_roi] with shape:
+            X_img:
+            `(1, channels, rows, cols)` if dim_ordering='th'
+            or 4D tensor with shape:
+            `(1, rows, cols, channels)` if dim_ordering='tf'.
+            X_roi:
+            `(1,num_rois,4)` list of rois, with ordering (x,y,w,h)
+        # Output shape
+            3D tensor with shape:
+            `(1, num_rois, channels, pool_size, pool_size)`
+        '''
+
+        def __init__(self, pool_size, num_rois, **kwargs):
+
+            self.dim_ordering = K.image_dim_ordering()
+            assert self.dim_ordering in {'tf', 'th'}, 'dim_ordering must be in {tf, th}'
+
+            self.pool_size = pool_size
+            self.num_rois = num_rois
+
+            super(RoiPoolingConv, self).__init__(**kwargs)
+
+        def build(self, input_shape):
+            if self.dim_ordering == 'th':
+                self.nb_channels = input_shape[0][1]
+            elif self.dim_ordering == 'tf':
+                self.nb_channels = input_shape[0][3]
+
+        def compute_output_shape(self, input_shape):
+            if self.dim_ordering == 'th':
+                return None, self.num_rois, self.nb_channels, self.pool_size, self.pool_size
+            else:
+                return None, self.num_rois, self.pool_size, self.pool_size, self.nb_channels
+
+        def call(self, x, mask=None):
+
+            assert (len(x) == 2)
+
+            img = x[0]
+            rois = x[1]
+
+            input_shape = K.shape(img)
+
+            outputs = []
+
+            for roi_idx in range(self.num_rois):
+
+                x = rois[0, roi_idx, 0]
+                y = rois[0, roi_idx, 1]
+                w = rois[0, roi_idx, 2]
+                h = rois[0, roi_idx, 3]
+
+                row_length = w / float(self.pool_size)
+                col_length = h / float(self.pool_size)
+
+                num_pool_regions = self.pool_size
+
+                # NOTE: the RoiPooling implementation differs between theano and tensorflow due to the lack of a resize op
+                # in theano. The theano implementation is much less efficient and leads to long compile times
+
+                if self.dim_ordering == 'th':
+                    for jy in range(num_pool_regions):
+                        for ix in range(num_pool_regions):
+                            x1 = x + ix * row_length
+                            x2 = x1 + row_length
+                            y1 = y + jy * col_length
+                            y2 = y1 + col_length
+
+                            x1 = K.cast(x1, 'int32')
+                            x2 = K.cast(x2, 'int32')
+                            y1 = K.cast(y1, 'int32')
+                            y2 = K.cast(y2, 'int32')
+
+                            x2 = x1 + K.maximum(1, x2 - x1)
+                            y2 = y1 + K.maximum(1, y2 - y1)
+
+                            new_shape = [input_shape[0], input_shape[1],
+                                         y2 - y1, x2 - x1]
+
+                            x_crop = img[:, :, y1:y2, x1:x2]
+                            xm = K.reshape(x_crop, new_shape)
+                            pooled_val = K.max(xm, axis=(2, 3))
+                            outputs.append(pooled_val)
+
+                elif self.dim_ordering == 'tf':
+                    x = K.cast(x, 'int32')
+                    y = K.cast(y, 'int32')
+                    w = K.cast(w, 'int32')
+                    h = K.cast(h, 'int32')
+
+                    rs = tf.image.resize_images(img[:, y:y + h, x:x + w, :], (self.pool_size, self.pool_size))
+                    outputs.append(rs)
+
+            final_output = K.concatenate(outputs, axis=0)
+            final_output = K.reshape(final_output, (1, self.num_rois, self.pool_size, self.pool_size, self.nb_channels))
+
+            if self.dim_ordering == 'th':
+                final_output = K.permute_dimensions(final_output, (0, 1, 4, 2, 3))
+            else:
+                final_output = K.permute_dimensions(final_output, (0, 1, 2, 3, 4))
+
+            return final_output
+
+
+    class FixedBatchNormalization(Layer):
+
+        def __init__(self, epsilon=1e-3, axis=-1,
+                     weights=None, beta_init='zero', gamma_init='one',
+                     gamma_regularizer=None, beta_regularizer=None, **kwargs):
+
+            self.supports_masking = True
+            self.beta_init = initializers.get(beta_init)
+            self.gamma_init = initializers.get(gamma_init)
+            self.epsilon = epsilon
+            self.axis = axis
+            self.gamma_regularizer = regularizers.get(gamma_regularizer)
+            self.beta_regularizer = regularizers.get(beta_regularizer)
+            self.initial_weights = weights
+            super(FixedBatchNormalization, self).__init__(**kwargs)
+
+        def build(self, input_shape):
+            self.input_spec = [InputSpec(shape=input_shape)]
+            shape = (input_shape[self.axis],)
+
+            self.gamma = self.add_weight(shape,
+                                         initializer=self.gamma_init,
+                                         regularizer=self.gamma_regularizer,
+                                         name='{}_gamma'.format(self.name),
+                                         trainable=False)
+            self.beta = self.add_weight(shape,
+                                        initializer=self.beta_init,
+                                        regularizer=self.beta_regularizer,
+                                        name='{}_beta'.format(self.name),
+                                        trainable=False)
+            self.running_mean = self.add_weight(shape, initializer='zero',
+                                                name='{}_running_mean'.format(self.name),
+                                                trainable=False)
+            self.running_std = self.add_weight(shape, initializer='one',
+                                               name='{}_running_std'.format(self.name),
+                                               trainable=False)
+
+            if self.initial_weights is not None:
+                self.set_weights(self.initial_weights)
+                del self.initial_weights
+
+            self.built = True
+
+        def call(self, x, mask=None):
+
+            assert self.built, 'Layer must be built before being called'
+            input_shape = K.int_shape(x)
+
+            reduction_axes = list(range(len(input_shape)))
+            del reduction_axes[self.axis]
+            broadcast_shape = [1] * len(input_shape)
+            broadcast_shape[self.axis] = input_shape[self.axis]
+
+            if sorted(reduction_axes) == range(K.ndim(x))[:-1]:
+                x_normed = K.batch_normalization(
+                    x, self.running_mean, self.running_std,
+                    self.beta, self.gamma,
+                    epsilon=self.epsilon)
+            else:
+                # need broadcasting
+                broadcast_running_mean = K.reshape(self.running_mean, broadcast_shape)
+                broadcast_running_std = K.reshape(self.running_std, broadcast_shape)
+                broadcast_beta = K.reshape(self.beta, broadcast_shape)
+                broadcast_gamma = K.reshape(self.gamma, broadcast_shape)
+                x_normed = K.batch_normalization(
+                    x, broadcast_running_mean, broadcast_running_std,
+                    broadcast_beta, broadcast_gamma,
+                    epsilon=self.epsilon)
+
+            return x_normed
+
+        def get_config(self):
+            config = {'epsilon': self.epsilon,
+                      'axis': self.axis,
+                      'gamma_regularizer': self.gamma_regularizer.get_config() if self.gamma_regularizer else None,
+                      'beta_regularizer': self.beta_regularizer.get_config() if self.beta_regularizer else None}
+            base_config = super(FixedBatchNormalization, self).get_config()
+            return dict(list(base_config.items()) + list(config.items()))
+
+    def get_weight_path():
+        if K.image_dim_ordering() == 'th':
+            return 'resnet50_weights_th_dim_ordering_th_kernels_notop.h5'
+        else:
+            return 'resnet50_weights_tf_dim_ordering_tf_kernels.h5'
+
+    def get_img_output_length(width, height):
+        def get_output_length(input_length):
+            # zero_pad
+            input_length += 6
+            # apply 4 strided convolutions
+            filter_sizes = [7, 3, 1, 1]
+            stride = 2
+            for filter_size in filter_sizes:
+                input_length = (input_length - filter_size + stride) // stride
+            return input_length
+
+        return get_output_length(width), get_output_length(height)
+
+    def identity_block(input_tensor, kernel_size, filters, stage, block, trainable=True):
+
+        nb_filter1, nb_filter2, nb_filter3 = filters
+
+        if K.image_dim_ordering() == 'tf':
+            bn_axis = 3
+        else:
+            bn_axis = 1
+
+        conv_name_base = 'res' + str(stage) + block + '_branch'
+        bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+        x = Convolution2D(nb_filter1, (1, 1), name=conv_name_base + '2a', trainable=trainable)(input_tensor)
+        x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
+        x = Activation('relu')(x)
+
+        x = Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', name=conv_name_base + '2b',
+                          trainable=trainable)(x)
+        x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
+        x = Activation('relu')(x)
+
+        x = Convolution2D(nb_filter3, (1, 1), name=conv_name_base + '2c', trainable=trainable)(x)
+        x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
+
+        x = Add()([x, input_tensor])
+        x = Activation('relu')(x)
+        return x
+
+    def identity_block_td(input_tensor, kernel_size, filters, stage, block, trainable=True):
+
+        # identity block time distributed
+
+        nb_filter1, nb_filter2, nb_filter3 = filters
+        if K.image_dim_ordering() == 'tf':
+            bn_axis = 3
+        else:
+            bn_axis = 1
+
+        conv_name_base = 'res' + str(stage) + block + '_branch'
+        bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+        x = TimeDistributed(Convolution2D(nb_filter1, (1, 1), trainable=trainable, kernel_initializer='normal'),
+                            name=conv_name_base + '2a')(input_tensor)
+        x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2a')(x)
+        x = Activation('relu')(x)
+
+        x = TimeDistributed(
+            Convolution2D(nb_filter2, (kernel_size, kernel_size), trainable=trainable, kernel_initializer='normal',
+                          padding='same'), name=conv_name_base + '2b')(x)
+        x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2b')(x)
+        x = Activation('relu')(x)
+
+        x = TimeDistributed(Convolution2D(nb_filter3, (1, 1), trainable=trainable, kernel_initializer='normal'),
+                            name=conv_name_base + '2c')(x)
+        x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2c')(x)
+
+        x = Add()([x, input_tensor])
+        x = Activation('relu')(x)
+
+        return x
+
+    def conv_block(input_tensor, kernel_size, filters, stage, block, strides=(2, 2), trainable=True):
+
+        nb_filter1, nb_filter2, nb_filter3 = filters
+        if K.image_dim_ordering() == 'tf':
+            bn_axis = 3
+        else:
+            bn_axis = 1
+
+        conv_name_base = 'res' + str(stage) + block + '_branch'
+        bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+        x = Convolution2D(nb_filter1, (1, 1), strides=strides, name=conv_name_base + '2a', trainable=trainable)(
+            input_tensor)
+        x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
+        x = Activation('relu')(x)
+
+        x = Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', name=conv_name_base + '2b',
+                          trainable=trainable)(x)
+        x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
+        x = Activation('relu')(x)
+
+        x = Convolution2D(nb_filter3, (1, 1), name=conv_name_base + '2c', trainable=trainable)(x)
+        x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
+
+        shortcut = Convolution2D(nb_filter3, (1, 1), strides=strides, name=conv_name_base + '1', trainable=trainable)(
+            input_tensor)
+        shortcut = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '1')(shortcut)
+
+        x = Add()([x, shortcut])
+        x = Activation('relu')(x)
+        return x
+
+    def conv_block_td(input_tensor, kernel_size, filters, stage, block, input_shape, strides=(2, 2), trainable=True):
+
+        # conv block time distributed
+
+        nb_filter1, nb_filter2, nb_filter3 = filters
+        if K.image_dim_ordering() == 'tf':
+            bn_axis = 3
+        else:
+            bn_axis = 1
+
+        conv_name_base = 'res' + str(stage) + block + '_branch'
+        bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+        x = TimeDistributed(
+            Convolution2D(nb_filter1, (1, 1), strides=strides, trainable=trainable, kernel_initializer='normal'),
+            input_shape=input_shape, name=conv_name_base + '2a')(input_tensor)
+        x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2a')(x)
+        x = Activation('relu')(x)
+
+        x = TimeDistributed(Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', trainable=trainable,
+                                          kernel_initializer='normal'), name=conv_name_base + '2b')(x)
+        x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2b')(x)
+        x = Activation('relu')(x)
+
+        x = TimeDistributed(Convolution2D(nb_filter3, (1, 1), kernel_initializer='normal'), name=conv_name_base + '2c',
+                            trainable=trainable)(x)
+        x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2c')(x)
+
+        shortcut = TimeDistributed(
+            Convolution2D(nb_filter3, (1, 1), strides=strides, trainable=trainable, kernel_initializer='normal'),
+            name=conv_name_base + '1')(input_tensor)
+        shortcut = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '1')(shortcut)
+
+        x = Add()([x, shortcut])
+        x = Activation('relu')(x)
+        return x
+
+    def nn_base(input_tensor=None, trainable=False):
+
+        # Determine proper input shape
+        if K.image_dim_ordering() == 'th':
+            input_shape = (3, None, None)
+        else:
+            input_shape = (None, None, 3)
+
+        if input_tensor is None:
+            img_input = Input(shape=input_shape)
+        else:
+            if not K.is_keras_tensor(input_tensor):
+                img_input = Input(tensor=input_tensor, shape=input_shape)
+            else:
+                img_input = input_tensor
+
+        if K.image_dim_ordering() == 'tf':
+            bn_axis = 3
+        else:
+            bn_axis = 1
+
+        x = ZeroPadding2D((3, 3))(img_input)
+
+        x = Convolution2D(64, (7, 7), strides=(2, 2), name='conv1', trainable=trainable)(x)
+        x = FixedBatchNormalization(axis=bn_axis, name='bn_conv1')(x)
+        x = Activation('relu')(x)
+        x = MaxPooling2D((3, 3), strides=(2, 2))(x)
+
+        x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1), trainable=trainable)
+        x = identity_block(x, 3, [64, 64, 256], stage=2, block='b', trainable=trainable)
+        x = identity_block(x, 3, [64, 64, 256], stage=2, block='c', trainable=trainable)
+
+        x = conv_block(x, 3, [128, 128, 512], stage=3, block='a', trainable=trainable)
+        x = identity_block(x, 3, [128, 128, 512], stage=3, block='b', trainable=trainable)
+        x = identity_block(x, 3, [128, 128, 512], stage=3, block='c', trainable=trainable)
+        x = identity_block(x, 3, [128, 128, 512], stage=3, block='d', trainable=trainable)
+
+        x = conv_block(x, 3, [256, 256, 1024], stage=4, block='a', trainable=trainable)
+        x = identity_block(x, 3, [256, 256, 1024], stage=4, block='b', trainable=trainable)
+        x = identity_block(x, 3, [256, 256, 1024], stage=4, block='c', trainable=trainable)
+        x = identity_block(x, 3, [256, 256, 1024], stage=4, block='d', trainable=trainable)
+        x = identity_block(x, 3, [256, 256, 1024], stage=4, block='e', trainable=trainable)
+        x = identity_block(x, 3, [256, 256, 1024], stage=4, block='f', trainable=trainable)
+
+        return x
+
+    def classifier_layers(x, input_shape, trainable=False):
+
+        # compile times on theano tend to be very high, so we use smaller ROI pooling regions to workaround
+        # (hence a smaller stride in the region that follows the ROI pool)
+        if K.backend() == 'tensorflow':
+            x = conv_block_td(x, 3, [512, 512, 2048], stage=5, block='a', input_shape=input_shape, strides=(2, 2),
+                              trainable=trainable)
+        elif K.backend() == 'theano':
+            x = conv_block_td(x, 3, [512, 512, 2048], stage=5, block='a', input_shape=input_shape, strides=(1, 1),
+                              trainable=trainable)
+
+        x = identity_block_td(x, 3, [512, 512, 2048], stage=5, block='b', trainable=trainable)
+        x = identity_block_td(x, 3, [512, 512, 2048], stage=5, block='c', trainable=trainable)
+        x = TimeDistributed(AveragePooling2D((7, 7)), name='avg_pool')(x)
+
+        return x
+
+    def rpn(base_layers, num_anchors):
+
+        x = Convolution2D(512, (3, 3), padding='same', activation='relu', kernel_initializer='normal',
+                          name='rpn_conv1')(base_layers)
+
+        x_class = Convolution2D(num_anchors, (1, 1), activation='sigmoid', kernel_initializer='uniform',
+                                name='rpn_out_class')(x)
+        x_regr = Convolution2D(num_anchors * 4, (1, 1), activation='linear', kernel_initializer='zero',
+                               name='rpn_out_regress')(x)
+
+        return [x_class, x_regr, base_layers]
+
+    def classifier(base_layers, input_rois, num_rois, nb_classes=21, trainable=False):
+
+        # compile times on theano tend to be very high, so we use smaller ROI pooling regions to workaround
+
+        if K.backend() == 'tensorflow':
+            pooling_regions = 14
+            input_shape = (num_rois, 14, 14, 1024)
+        elif K.backend() == 'theano':
+            pooling_regions = 7
+            input_shape = (num_rois, 1024, 7, 7)
+
+        out_roi_pool = RoiPoolingConv(pooling_regions, num_rois)([base_layers, input_rois])
+        out = classifier_layers(out_roi_pool, input_shape=input_shape, trainable=True)
+
+        out = TimeDistributed(Flatten())(out)
+
+        out_class = TimeDistributed(Dense(nb_classes, activation='softmax', kernel_initializer='zero'),
+                                    name='dense_class_{}'.format(nb_classes))(out)
+        # note: no regression target for bg class
+        out_regr = TimeDistributed(Dense(4 * (nb_classes - 1), activation='linear', kernel_initializer='zero'),
+                                   name='dense_regress_{}'.format(nb_classes))(out)
+        return [out_class, out_regr]
+
+    sys.setrecursionlimit(40000)
+    config_output_filename = r'resnet_40000_ht_config.pickle'
+
+    with open(config_output_filename, 'rb') as f_in:
+        C = pickle.load(f_in)
+
+    C.use_horizontal_flips = False
+    C.use_vertical_flips = False
+    C.rot_90 = False
+
+
+    def format_img_size(img, C):
+        """ formats the image size based on config """
+        img_min_side = float(C.im_size)
+        (height, width, _) = img.shape
+
+        if width <= height:
+            ratio = img_min_side / width
+            new_height = int(ratio * height)
+            new_width = int(img_min_side)
+        else:
+            ratio = img_min_side / height
+            new_width = int(ratio * width)
+            new_height = int(img_min_side)
+        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+        return img, ratio
+
+    def format_img_channels(img, C):
+        """ formats the image channels based on config """
+        img = img[:, :, (2, 1, 0)]
+        img = img.astype(np.float32)
+        img[:, :, 0] -= C.img_channel_mean[0]
+        img[:, :, 1] -= C.img_channel_mean[1]
+        img[:, :, 2] -= C.img_channel_mean[2]
+        img /= C.img_scaling_factor
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, axis=0)
+        return img
+
+    def format_img(img, C):
+        """ formats an image for model prediction based on config """
+        img, ratio = format_img_size(img, C)
+        img = format_img_channels(img, C)
+        return img, ratio
+
+    # Method to transform the coordinates of the bounding box to its original size
+    def get_real_coordinates(ratio, x1, y1, x2, y2):
+
+        real_x1 = int(round(x1 // ratio))
+        real_y1 = int(round(y1 // ratio))
+        real_x2 = int(round(x2 // ratio))
+        real_y2 = int(round(y2 // ratio))
+
+        return (real_x1, real_y1, real_x2, real_y2)
+
+    class_mapping = C.class_mapping
+
+    if 'bg' not in class_mapping:
+        class_mapping['bg'] = len(class_mapping)
+
+    class_mapping = {v: k for k, v in class_mapping.items()}
+    print(class_mapping)
+    C.num_rois = 300
+    num_features = 1024
+
+    input_shape_img = (None, None, 3)
+    input_shape_features = (None, None, num_features)
+
+    img_input = Input(shape=input_shape_img)
+    roi_input = Input(shape=(C.num_rois, 4))
+    feature_map_input = Input(shape=input_shape_features)
+
+    # define the base network (resnet here, can be VGG, Inception, etc)
+    shared_layers = nn_base(img_input, trainable=True)
+
+    # define the RPN, built on the base layers
+    num_anchors = len(C.anchor_box_scales) * len(C.anchor_box_ratios)
+    rpn_layers = rpn(shared_layers, num_anchors)
+
+    classifier = classifier(feature_map_input, roi_input, C.num_rois, nb_classes=len(class_mapping), trainable=True)
+
+    model_rpn = Model(img_input, rpn_layers)
+    model_classifier_only = Model([feature_map_input, roi_input], classifier)
+
+    model_classifier = Model([feature_map_input, roi_input], classifier)
+    C.model_path = r'resnet50_new_model_40000_ht_2.hdf5'
+    print('Loading weights from {}'.format(C.model_path))
+    model_rpn.load_weights(C.model_path, by_name=True)
+    model_classifier.load_weights(C.model_path, by_name=True)
+
+    model_rpn.compile(optimizer='sgd', loss='mse')
+    model_classifier.compile(optimizer='sgd', loss='mse')
+
+    if img_path:
+        st = time.time()
+        for idx, img_name in enumerate(sorted(os.listdir(img_path))):  # need to change
+            if not img_name.lower().endswith(('.bmp', '.jpeg', '.jpg', '.png', '.tif', '.tiff')):
+                continue
+            print(img_name)
+            filepath = os.path.join(img_path, img_name)
+
+            img_raw = cv2.imread(filepath,1)
+            img = apply_ahe(img_raw)
+            img_raw_seg = img_raw.copy()
+            img_raw_det = img_raw.copy()
+
+            X, ratio = format_img(img, C)
+
+            if K.image_dim_ordering() == 'tf':
+                X = np.transpose(X, (0, 2, 3, 1))
+
+            # get the feature maps and output from the RPN
+            [Y1, Y2, F] = model_rpn.predict(X)
+
+            R = rpn_to_roi(Y1, Y2, C, K.image_dim_ordering(), overlap_thresh=0.7)
+
+            # convert from (x1,y1,x2,y2) to (x,y,w,h)
+            R[:, 2] -= R[:, 0]
+            R[:, 3] -= R[:, 1]
+
+            # apply the spatial pyramid pooling to the proposed regions
+            bboxes = {}
+            probs = {}
+
+            for jk in range(R.shape[0] // C.num_rois + 1):
+                ROIs = np.expand_dims(R[C.num_rois * jk:C.num_rois * (jk + 1), :], axis=0)
+                if ROIs.shape[1] == 0:
+                    break
+
+                if jk == R.shape[0] // C.num_rois:
+                    # pad R
+                    curr_shape = ROIs.shape
+                    target_shape = (curr_shape[0], C.num_rois, curr_shape[2])
+                    ROIs_padded = np.zeros(target_shape).astype(ROIs.dtype)
+                    ROIs_padded[:, :curr_shape[1], :] = ROIs
+                    ROIs_padded[0, curr_shape[1]:, :] = ROIs[0, 0, :]
+                    ROIs = ROIs_padded
+
+                [P_cls, P_regr] = model_classifier_only.predict([F, ROIs])
+
+                for ii in range(P_cls.shape[1]):
+
+                    if np.max(P_cls[0, ii, :]) < bbox_threshold or np.argmax(P_cls[0, ii, :]) == (P_cls.shape[2] - 1):
+                        continue
+
+                    cls_name = class_mapping[np.argmax(P_cls[0, ii, :])]
+
+                    if cls_name not in bboxes:
+                        bboxes[cls_name] = []
+                        probs[cls_name] = []
+
+                    (x, y, w, h) = ROIs[0, ii, :]
+
+                    cls_num = np.argmax(P_cls[0, ii, :])
+                    try:
+                        (tx, ty, tw, th) = P_regr[0, ii, 4 * cls_num:4 * (cls_num + 1)]
+                        tx /= C.classifier_regr_std[0]
+                        ty /= C.classifier_regr_std[1]
+                        tw /= C.classifier_regr_std[2]
+                        th /= C.classifier_regr_std[3]
+                        x, y, w, h = apply_regr(x, y, w, h, tx, ty, tw, th)
+                    except:
+                        pass
+                    bboxes[cls_name].append(
+                        [C.rpn_stride * x, C.rpn_stride * y, C.rpn_stride * (x + w), C.rpn_stride * (y + h)])
+                    probs[cls_name].append(np.max(P_cls[0, ii, :]))
+
+            all_dets = []
+            nm = 0
+            for key in bboxes:
+                bbox = np.array(bboxes[key])
+
+                new_boxes, new_probs = c_nms(bbox, np.array(probs[key]), nms_threshold=0.8)
+                a = 0
+                x1_list, y1_list, x2_list, y2_list = [], [], [], []
+                for jk in range(new_boxes.shape[0]):
+                    (x1, y1, x2, y2) = new_boxes[jk, :]
+
+                    (real_x1, real_y1, real_x2, real_y2) = get_real_coordinates(ratio, x1, y1, x2, y2)
+                    x1_list.append(real_x1)
+                    y1_list.append(real_y1)
+                    x2_list.append(real_x2)
+                    y2_list.append(real_y2)
+                    color_ = np.random.randint(0, 255, 3)
+                    color_ = [int(c) for c in color_]
+
+                    cv2.rectangle(img_raw_det, (real_x1, real_y1), (real_x2, real_y2), color_, 3)
+                    textLabel = '{}: {}'.format(key,int(100*new_probs[jk]))
+                    all_dets.append((key,100*new_probs[jk]))
+
+                    (retval,baseLine) = cv2.getTextSize(textLabel,cv2.FONT_HERSHEY_COMPLEX,1,1)
+                    textOrg = (real_x1, real_y1-0)
+
+                    cv2.rectangle(img_raw_det, (textOrg[0] - 5, textOrg[1]+baseLine - 5), (textOrg[0]+retval[0] + 5, textOrg[1]-retval[1] - 5), (0, 0, 0), 2)
+                    cv2.rectangle(img_raw_det, (textOrg[0] - 5,textOrg[1]+baseLine - 5), (textOrg[0]+retval[0] + 5, textOrg[1]-retval[1] - 5), (255, 255, 255), -1)
+                    cv2.putText(img_raw_det, textLabel, textOrg, cv2.FONT_HERSHEY_DUPLEX, 1, (0, 0, 0), 1)
+                    a += 1
+                nm += a
+
+                # below is the segmentation part
+                x1 = max(min(x1_list)-bias, 0)
+                x2 = min(max(x2_list)+bias, img.shape[1])
+                y1 = max(min(y1_list)-bias, 0)
+                y2 = min(max(y2_list)+bias, img.shape[0])
+                ptLeftTop, ptRightBottom = bbox_reg(x1, y1, x2, y2, img.shape[1],img.shape[0], alpha=0.7)
+                crop_more = img_raw[ptLeftTop[1]:ptRightBottom[1],ptLeftTop[0]:ptRightBottom[0],:]
+
+                if needAjust(crop_more):
+                    crop_more = color_scale_display(crop_more, 0, 170, 1.53)
+
+                # denoise
+                _denoise_tv = partial(denoise_tv_chambolle, multichannel=True)
+                parameter_ranges = {'weight': np.arange(0.1, 0.9, 0.1),
+                                    'multichannel': [True]}
+                calibrated_denoiser = calibrate_denoiser(crop_more, _denoise_tv,
+                                                         denoise_parameters=parameter_ranges)
+                crop_more = np.uint8(calibrated_denoiser(crop_more) * 255)
+
+                enhance = enhance_cell(crop_more)  # increase contrast
+                img_raw[ptLeftTop[1]:ptRightBottom[1],ptLeftTop[0]:ptRightBottom[0],:] = enhance
+                for _x1, _y1, _x2, _y2 in zip(x1_list,y1_list,x2_list,y2_list):
+
+                    _x1 = max(_x1 - bias, 0)
+                    _x2 = min(_x2 + bias, img.shape[1])
+                    _y1 = max(_y1 - bias, 0)
+                    _y2 = min(_y2 + bias, img.shape[0])
+                    _rect = (_x1, _y1, _x2 - _x1, _y2 - _y1)
+                    canvas = grab_cut(img_raw, _rect)
+                    if np.max(canvas) == 0:
+                        continue
+                    canvas = maxRegionFilter(canvas)
+
+                    # draw contours
+                    color = np.random.randint(0, 255, 3)
+                    color = [int(c) for c in color]
+                    contours, _ = cv2.findContours(np.uint8(canvas), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(img_raw_seg, contours, -1, color, 3)
+
+            # save
+            print('Elapsed time = {}'.format(time.time() - st))
+            print(all_dets)
+            img_name_prefix = img_name.split('.')[0]
+            detection_output_path = os.path.join(out_dir, 'detection', img_name_prefix+'_'+str(nm)+'.png')
+            cv2.imwrite(detection_output_path, img_raw_det)
+
+            segmentation_output_path = os.path.join(out_dir, 'segmentation', img_name_prefix +'.png')
+            cv2.imwrite(segmentation_output_path, img_raw_seg)
+
+
+if __name__ == '__main__':
+
+    bias = 15  # bbox bias, let the bbox fully contain the blastomere
+    img_dir = 'images'
+    save_dir = 'outputs'
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        os.makedirs(os.path.join(save_dir, 'detection'))
+        os.makedirs(os.path.join(save_dir, 'segmentation'))
+    main(img_path=img_dir, out_dir=save_dir)
