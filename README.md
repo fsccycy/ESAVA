@@ -4,7 +4,7 @@ Embryo Segmentation and Viability Assessment
 ## ABSTRACT
 The selection of embryos is a key for the success of in vitro fertilization (IVF). Automatic quality assessment on human IVF embryos with optical microscope images is still challenging. In this study, we developed a clinical consensus-compliant deep learning approach called Esava (Embryo Segmentation and Viability Assessment) to quantitatively evaluate the development of IVF embryos of day-2 and day-3 with optical microscope images. By refining the baseline Faster R-CNN model, our Esava model was constructed, refined, trained, validated, and optimized for precise and robust embryonic cells detection. A novel algorithm Crowd-NMS was proposed and employed in Esava to enhance the object detection and to precisely quantify the embryonic cells and their sizes. The difference proportion of blastomere diameters were computed to evaluate their size uniformity. Another novel GrabCut-based unsupervised module was further applied in Esava to perform the segmentation of blastomeres and embryos.
 
-## Model Checkpoint
+## <a name="Models"></a>Model Checkpoint
 - `Weights`: [resnet50_new_model_40000_ht_2.hdf5](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth)
 
 ## USAGE1
