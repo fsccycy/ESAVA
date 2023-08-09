@@ -26,6 +26,6 @@ The selection of embryos is a key for the success of in vitro fertilization (IVF
 
 ## DEMO
 <p float="left">
-  <img src="assets/detection_demo.png?raw=true" width="50%" />
-  <img src="assets/segmentation_demo.png?raw=true" width="50%" />
+  <img src="detection_demo.png?raw=true" width="50%" />
+  <img src="segmentation_demo.png?raw=true" width="50%" />
 </p>
