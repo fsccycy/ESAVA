@@ -14,8 +14,8 @@ The selection of embryos is a key for the success of in vitro fertilization (IVF
 * Put the blastomere images in the "images" folder and run the script **python blastomere_detection_segmentation.py**
 
 ## WORKFLOW
-The overall workflow of ESAVA is below.
+The overall workflow of ESAVA is:
 ![ESAVA design](ESAVA_workflow.jpg?raw=true)
 
-The segmentation workflow is below.
+The segmentation workflow is:
 ![Segmentation design](segmentation_workflow.jpg?raw=true)
