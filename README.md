@@ -19,10 +19,10 @@ The selection of embryos is a key for the success of in vitro fertilization (IVF
 - `Weights`: [resnet50_new_model_40000_ht_2.hdf5](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth)
 
 ## USAGE
-* Install python3.6.
-* Run the script **pip install -r requirements.txt**
-* Download the model weights "resnet50_new_model_40000_ht_2.hdf5" from [model checkpoint](#model-checkpoint), and put it in the same directory as [blastomere_detection_segmentation.py](#blastomere-detection-segmentation).
-* Put the blastomere images in the "images" folder and run the script **python blastomere_detection_segmentation.py**
+* Install python3.6 .
+* Run the script **pip install -r requirements.txt** .
+* Download the model weights "resnet50_new_model_40000_ht_2.hdf5" from [model checkpoint](#model-checkpoint), and put it in the same directory as [blastomere_detection_segmentation.py](#blastomere-detection-segmentation) .
+* Put the blastomere images in the "images" folder and run the script **python blastomere_detection_segmentation.py** .
 
 ## DEMO
 <p float="left">
