@@ -16,7 +16,7 @@ The selection of embryos is a key for the success of in vitro fertilization (IVF
 </p>
 
 ## Model Checkpoint
-- `Weights`: [resnet50_new_model_40000_ht_2.hdf5](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth)
+- `Weights`: [resnet50_new_model_40000_ht_2.hdf5](http://www.liwzlab.cn/cy_data/qz/resnet50_new_model_40000_ht_2.hdf5)
 
 ## USAGE
 * Install python3.6.
